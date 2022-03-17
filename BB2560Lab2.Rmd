@@ -1,0 +1,665 @@
+---
+title: "Computer exercise in R"
+output:
+  html_notebook: default
+  html_document: default
+  pdf_document: default
+---
+
+#### BB2560 Advanced Microbiology and Metagenomics
+
+## Part I: Generating the ASV table
+
+### _In RStudio:_
+### Loading packages
+
+First we load the required packages into R (since it is not one of the standard packages):
+```{r eval=F}
+library(dada2)
+library(edgeR)
+library(pheatmap)
+library(vegan)
+```
+
+
+### Loading sequences into R
+
+You can access the help pages for this package by:
+```{r eval=F}
+help(package="dada2")
+```
+
+Then we set the Working Directory to the `BB2560` directory where you have the input files (or whatever the name of that directory is): Under the scroll-down meny called "Session", select "Set Working Directory", select "Chose Directory..." and select the correct directory.
+Now you can list the files in the working directory:
+
+```{r eval=F}
+list.files()
+```
+
+We next read a tab delimited file that we have prepared for you, with information about the different samples, and print the resulting dataframe `sample_info` on the screen to see how it looks.
+
+```{r eval=F}
+sample_info = read.delim("BB2560_lab2_Feb2022_sample_info.txt")
+sample_info
+```
+
+The first column gives the ID that the sequencing facility (NGI at Scilifelab) has given the sample, followed by the sample name that the students used, followed by sample type and sample treatment. Let's extract those different columns and put them in seperate vectors.
+
+```{r eval=F}
+ngi_sample_id = sample_info[,1]
+sample_name = sample_info[,2]
+sample_type = sample_info[,3]
+```
+
+Now we find the sequence files (the fastq files) corresponding to each of the samples and put the names of these files in vectors, one vector for the forward reads (`fnFs`) and one for the reverse reads (`fnRs`). The forward and the reverse fastq filenames have the format (e.g.): `P12610_1014_S14_L001_R1_001.fastq` and `P12610_1014_S14_L001_R2_001.fastq`, where `P12610_1014` is the sample ID given by the NGI sequencing facility.
+
+```{r eval=F}
+# Find position in the list of forward read filenames that matches each NGI ID
+# ...then extract the filenames of forward reads
+fnFs = list.files(pattern="_R1_001.fastq")
+
+# Find position in the list of reverse read filenames that matches each NGI ID
+# ...then extract the filenames of reverse reads
+fnRs = list.files(pattern="_R2_001.fastq")
+
+# Check that the forward and reverse fastq files come in the same order
+fnFs
+fnRs
+```
+
+The file names of `fnFs` and `fnRs` should now have the same order as the samples are ordered in `ngi_sample_id`.
+
+### Inspecting read quality profiles
+
+```{r eval=F}
+plotQualityProfile(fnFs[1:4])
+```
+
+The gray-scale in the background is a heatmap of the frequency of each quality value (y-axis) at each base position (x-axis). The median quality value at each position is shown by the green line, and the upper and lower quartiles of the quality value distribution by the orange lines. The flat red line shows the scaled proportion of reads that extend to at least that position (this is more useful for other sequencing technologies, as Illumina reads are typically all the same lenghth, hence the flat red line).
+
+Now let's plot the quality profiles of the reverse reads:
+```{r eval=F}
+plotQualityProfile(fnRs[1:4])
+```
+
+The reverse Illumina reads are usually of worse quality, especially at the end. This isn't a major problem, as DADA2 incorporates quality information into its error model which makes the algorithm rather robust to low quality sequence, but trimming off low quality data in the ends still improves the algorithm's performance. We will truncate both forward and reverse reads at position 180, since this will still leave enough sequence for the forward and reverse reads to be overlapping, which will allow us to merge them later.
+
+### Filtering and trimming sequences
+
+First we assign filenames for the filtered fastq.gz files that we will generate soon. By the way, .gz means the file will be compressed (zipped) to save space. DADA2 can operate on zipped files.
+```{r eval=F}
+filtFs = file.path("filtered", paste0(ngi_sample_id,"_F_filt.fastq.gz"))
+filtRs = file.path("filtered", paste0(ngi_sample_id,"_R_filt.fastq.gz"))
+```
+
+Then we do the actual filtering/trimming and generate the filtered fastq.gz files by using the `filterAndTrim` function included in the DADA2 package.
+We set the `truncLen` parameter of the function to trim the forward and reverse reads at position 180 and 180, respectively. And since the beginning of each read come from our PCR primers, and not from the actual sequence of the microbe, we use the `trimLeft` parameter to remove the first 19 and 21 bases, respectively (corresponding to the lengths of the primers). The length of the remaining reads will be `truncLen - trimLeft`. We use the DADA2 standard settings for the other filtering parameters:
+
+`maxN=0`: No undetermined bases (Ns) are allowed. Read pairs having them will be removed.
+
+`truncQ=2`: Reads will be truncated at the first instance of a quality score less than or equal to 2.
+
+`rm.phix=TRUE`: Read pairs that match the phiX genome are removed (phiX is often added in the sequencing as a type of control DNA).
+
+`maxEE=2`: The maxEE parameter sets the maximum number of expected errors allowed in a read.
+
+```{r eval=F}
+out = filterAndTrim(
+  fnFs, filtFs, fnRs, filtRs,
+  truncLen=c(180,180), trimLeft=c(0,0),
+  maxN=0, maxEE=c(2,2), truncQ=2, rm.phix=TRUE,
+  compress=TRUE, multithread=TRUE
+)
+out
+```
+
+To check the results we can plot the quality data of the trimmed reads:
+```{r eval=F}
+# For a few of forward files
+plotQualityProfile(filtFs[1:4])
+
+# And a few of reverse files
+plotQualityProfile(filtRs[1:4])
+```
+### Denoising the sequences
+
+The DADA2 algorithm makes use of a sequencing error model that is different for every amplicon dataset. The `learnErrors` function learns this error model from the data, by alternating estimation of the error rates and inference of sample composition until they converge on a jointly consistent solution.
+
+The error rates are inferred separately for the forward and reverse reads:
+```{r eval=F}
+# we start with the forward reads
+errF = learnErrors(filtFs, multithread=TRUE)
+
+# and the same for the reverse reads
+errR = learnErrors(filtRs, multithread=TRUE)
+```
+
+Next we dereplicate the data. The dereplication combines all identical sequencing reads into "unique sequences" with a corresponding "abundance" value equal to the number of reads having that unique sequence.
+
+```{r eval=F}
+# Run dereplication
+derepFs = derepFastq(filtFs, verbose=TRUE)
+derepRs = derepFastq(filtRs, verbose=TRUE)
+
+# Name the derep-class objects by the sample names:
+names(derepFs) = sample_name
+names(derepRs) = sample_name
+```
+
+To check how many unique sequences are present in the different samples (for forward reads):
+
+```{r eval=F}
+derepFs
+```
+
+
+Now we infer the true sequence variants from the unique sequences, i.e. run the actual denoising step. We do this separately for the forward and reverse sequences:
+
+```{r eval=F}
+dadaFs = dada(derepFs, err=errF, multithread=TRUE)
+dadaRs = dada(derepRs, err=errR, multithread=TRUE)
+```
+
+To check how many (denoised) sequence variants are present in the different samples (for forward reads):
+
+```{r eval=F}
+dadaFs
+```
+
+
+Now we will merge the forward and reverse reads of the read pairs. Merging is performed by aligning the denoised forward reads with the reverse-complement of the corresponding denoised reverse reads, and then constructing the merged "contig" sequences. By default, merged sequences are only output for a pair if the forward and reverse reads overlap by at least 12 bases, and are identical to each other in the overlap region.
+
+```{r eval=F}
+mergers = mergePairs(dadaFs, derepFs, dadaRs, derepRs, verbose=TRUE)
+```
+
+From the merged seqeunces we can now construct an amplicon sequence variant table (ASV) table, This is a matrix with rows corresponding to (and named by) the samples, and columns corresponding to (and named by) the sequence variants.
+
+```{r eval=F}
+seqtab = makeSequenceTable(mergers)
+```
+
+### Removing chimeras
+The core DADA2 method corrects substitution and insertion/deletion errors, but chimeras remain. Chimeras sometime form in the PCR if partially amplified molecules dissociate and anneal unspecifically to templates from other species, serving as primers for new, chimeric sequences. DADA2 has a function that identifies chimeric sequences as sequences that can be exactly reconstructed by combining a left-segment and a right-segment from two more abundant "parent" sequences. We use this to remove chimeras from the `seqtab` sequence table
+
+```{r eval=F}
+seqtab = removeBimeraDenovo(
+  seqtab, method="consensus", multithread=TRUE, verbose=TRUE
+)
+```
+
+Finally we transpose the `seqtab` matrix to get the ASVs per row and their counts in the different samples in columns:
+
+```{r eval=F}
+seqtab = t(seqtab)
+```
+
+The column names of `seqtab` should now be the same as `sample_name` and the row names should be the ASV sequences. We copy the ASV sequences into a new vector `asv` and rename the rows to ASV1, ASV2, etc (since the long sequences can be rather impractical to have as rownames):
+
+```{r eval=F}
+# to check the column names
+colnames(seqtab)
+
+# to check the row names
+rownames(seqtab)
+
+# to copy the ASV sequences into a new vector
+asv = rownames(seqtab)
+
+# to rename the rows
+rownames(seqtab) = paste("ASV", 1:length(asv), sep = "")
+
+# to check the new row names
+rownames(seqtab)
+```
+
+### Taxonomic classification
+
+To get a taxonomic label of each ASV we use the function `assignTaxonomy` in the DADA2 package that takes as input a set of sequences to be classified and a set of reference sequences with known taxonomy to match the sequences against, and outputs taxonomic assignments. The underlying algorithm uses a naive bayesian classification approach based on exact matches of 8-letter substrings (8-mers) of the sequences, and it performs so called bootstrapping to give probability estimates of the correctness of the assignment. This will take some time so maybe take a coffee break meanwhile.
+
+```{r eval=F}
+set.seed(123) 
+taxa = assignTaxonomy(
+  asv, "silva_nr99_v138.1_train_set.fa.gz",
+  multithread=TRUE,
+  taxLevels = c("Domain", "Phylum", "Class", "Order", "Family", "Genus")
+)
+
+taxa <- addSpecies(taxa, "silva_species_assignment_v138.1.fa.gz", allowMultiple = FALSE)
+#allowMultiple (Optional). Default FALSE. Defines the behavior when exact matches to multiple (different) species are found. By default, only unambiguous identifications are returned. If set to TRUE, a concatenated string of all exactly matched species is returned.
+
+# we name the rows of taxa as the rows of seqtab, ie with ASV ids
+rownames(taxa) = rownames(seqtab)
+```
+
+
+The resulting `taxa` is a matrix where each row corresponds to an ASV and the columns give taxonomic labels at differens taxonomic levels, from domain (first column) to genus level (last column). If an ASV could not be classified to the most detailed (genus) level (due to too low bootstrap support), it will have `NA` at one or several levels.
+
+```{r eval=F}
+# check what's in the different columns
+colnames(taxa)
+
+# to for example see the class-level annotation of the 4th ASV, do:
+taxa[4,3]
+```
+
+
+## Part II: Ecological analysis
+
+### Normalising the ASV table
+
+Since the total number of reads differ between samples, it is common to perform some type of normalisation of the ASV count data. A simple approach is to transform the counts into relative abundances, by dividing the ASV counts of each sample by the total number of counts in the sample. We can do this using a "for loop", normalising the counts of one sample at a time. We make a new matrix `norm_seqtab` wiht the normalised counts:
+
+```{r eval=F}
+norm_seqtab = seqtab
+for (i in 1:ncol(seqtab)) {
+  norm_seqtab[,i] = seqtab[,i]/sum(seqtab[,i])
+}
+```
+
+### Summarising counts at different taxonomic levels
+
+It may be useful to summarise the ASV count data at broader taxonomic levels, such as at the phylum level. By the below code we will make two count matrices, one with raw counts and one with normalised counts, per taxonomic level (from domain to genus (species)). These matrices will be stored in two "lists": `clade_counts` and `norm_clade_counts`. Lists are R objects which contain other objects, such as matrices.
+
+```{r eval=F}
+clade_counts = list()
+norm_clade_counts = list()
+
+for (i in 1:ncol(taxa)) {
+  matr = norm_matr = NULL
+  clade = unique(taxa[,i])
+  clade = clade[!is.na(clade)]
+  for (j in 1:length(clade)) {
+    ix = which(clade[j]==taxa[,i])
+    if (length(ix) > 1) {
+      matr = rbind(matr, apply(seqtab[ix,], 2, sum, na.rm=TRUE))
+      norm_matr = rbind(norm_matr, apply(norm_seqtab[ix,], 2, sum, na.rm=TRUE))
+    } else {
+      matr = rbind(matr, seqtab[ix,])
+      norm_matr = rbind(norm_matr, norm_seqtab[ix,])
+    }
+  }
+  rownames(matr) = rownames(norm_matr) = clade
+  colnames(matr) = colnames(norm_matr) = sample_name
+  clade_counts[[i]] = matr
+  norm_clade_counts[[i]] = norm_matr
+}
+```
+
+To refer to a specific object (a matrix in our case) in the list, one gives an index number withing double brackets. Then one can refer to the rows and columns of this matrix by using double indices, as for normal matrices. The samples (columns) come in the same order as in eg `seqtab`.
+
+```{r eval=F}
+# Let's check the counts of all phyla in the first sample:
+clade_counts[[7]][,1]
+
+# Or the counts of the third genus in samples 1-10:
+clade_counts[[6]][3,1:10]
+```
+
+
+### Making taxonomy barplots
+
+Having the clade count tables we can easily make illustrative barplots of the taxonomic composition:
+```{r eval=F}
+# set what taxonomic level to plot (1 - 6, corresponding to domain - genus)
+tax_level = 5
+
+# to select those clades with a relative abundance over a threshold (here 0.01)
+ok = which(apply(norm_clade_counts[[tax_level]], 1, mean) > 0.01)
+
+# to make a color palette
+mycols = colorRampPalette(c("#a6cee3",
+                            "#1f78b4",
+                            "#b2df8a",
+                            "#33a02c",
+                            "#fb9a99",
+                            "#e31a1c",
+                            "#fdbf6f",
+                            "#ff7f00",
+                            "#cab2d6",
+                            "#6a3d9a",
+                            "#ffff99",
+                            "#b15928"))
+
+# define the plotting area
+par(mfrow=c(1,1), mar=c(16,3,2,10), xpd = TRUE)
+
+# make the barplot
+barplot(
+  norm_clade_counts[[tax_level]][ok,],
+  col = mycols(length(ok)),
+  las = 2,
+  names.arg = paste(sample_type, sample_name)
+)
+
+# add a color legend
+legend(
+  "bottomleft", bty = "n", pch = 19,
+  col = mycols(length(ok))[1:length(ok)],
+  cex = 0.5, inset = c(1,0),
+  legend = rownames(clade_counts[[tax_level]])[ok]
+)
+```
+same as above but with problems (fewer samples in the plot)
+```{r eval=F}
+Milk = which(sample_type== alist("Cow milk raw", "Goat milk", "Oat milk"))
+Yoghurt = which(sample_type== alist("Oat yoghurt","Activia yoghurt","Soy yoghurt"))
+Cheese = which(sample_type== alist("Blue cheese", "unknown (Blue cheese?)" ,"Goat cheese Spain","Goat cheese France" ))
+Kimchi = which(sample_type== alist("kimchi shopbought"))
+Proviva = which(sample_type==alist("Nypon proviva"))
+Sourdough = which(sample_type== alist("Sourdough active","Sourdough dry"))
+Kombuscha = which(sample_type== alist("Kombucha homemade","Kombucha shopbought"))
+
+# and finally, a group with all samples, ordered by type and treatment
+all = c(
+  Milk, Yoghurt, Cheese, Kimchi, Proviva, Sourdough, Kombuscha
+)
+
+# define the plotting area
+par(mfrow=c(1,1), mar=c(7,3,2,10), xpd = TRUE)
+
+# set what taxonomic level to plot (1 - 7)
+tax_level = 3
+
+# to select those clades with a relative abundance over a threshold (here 0.01)
+ok = which(apply(norm_clade_counts[[tax_level]], 1, mean) > 0.01)
+
+# to make a color palette
+mycols = colorRampPalette(c("#a6cee3",
+                            "#1f78b4",
+                            "#b2df8a",
+                            "#33a02c",
+                            "#fb9a99",
+                            "#e31a1c",
+                            "#fdbf6f",
+                            "#ff7f00",
+                            "#cab2d6",
+                            "#6a3d9a",
+                            "#ffff99",
+                            "#b15928"))
+# make the barplot
+barplot(
+  norm_clade_counts[[tax_level]][ok,all],
+  col = mycols(length(ok)),
+  las = 2,
+    #names = c("Goat milk","Goat cheese France","Sourdough dry","Sourdough active","Oat yoghurt","Oat milk", "Cow milk raw","Nypon proviva","Blue cheese","Soy yoghurt","Nypon proviva","Nypon proviva", "Activia yoghurt","Nypon proviva","Activia yoghurt","Oat milk", "kimchi shopbought","Sourdough dry","Oat yoghurt","Nypon proviva","Blue cheese","Blue cheese","unknown (Activia yoghurt?)","unknown (Blue cheese?)","Kombucha homemade","Cow milk raw","Soy yoghurt","Sourdough active","Goat cheese Spain","Goat milk","unknown (kimchi shopbought?)","Goat cheese France","Oat milk","Goat cheese Spain", "Goat milk","Goat cheese Spain","Goat cheese France","Sourdough active","Goat cheese Spain","Goat milk", "Soy yoghurt","Kombucha shopbought","Oat milk","Soy yoghurt","Oat yoghurt","Oat milk","Cow milk raw","Cow milk raw","Sourdough active" ,"kimchi shopbought","Activia yoghurt","Activia yoghurt","Sourdough dry","kimchi shopbought"),
+ 
+  names.arg =paste(sample_type[all], sample_name[all])
+)
+
+# add a color legend
+legend(
+  "bottomleft", bty = "n", pch = 19,
+  col = mycols(length(ok))[1:length(ok)],
+  cex = 1, inset = c(1,0),
+  legend = rownames(clade_counts[[tax_level]])[ok]
+)
+```
+
+
+To more clearly see a pattern it would perhaps help to order the samples by sample type and treatment. Let's make a few sample groups:
+```{r eval=F}
+milk=grep('milk', sample_type, ignore.case=FALSE,perl = FALSE, value = FALSE, fixed=FALSE, useBytes = FALSE, invert = FALSE)
+cheese=grep('cheese', sample_type, ignore.case=FALSE,perl = FALSE, value = FALSE, fixed=FALSE, useBytes = FALSE, invert = FALSE)
+yoghurt=grep('yoghur', sample_type, ignore.case=FALSE,perl = FALSE, value = FALSE, fixed=FALSE, useBytes = FALSE, invert = FALSE)
+sourdough=grep('Sourdough', sample_type, ignore.case=FALSE,perl = FALSE, value = FALSE, fixed=FALSE, useBytes = FALSE, invert = FALSE)
+nypon=grep('Nypon', sample_type, ignore.case=FALSE,perl = FALSE, value = FALSE, fixed=FALSE, useBytes = FALSE, invert = FALSE)
+kombucha=grep('Kombucha', sample_type, ignore.case=FALSE,perl = FALSE, value = FALSE, fixed=FALSE, useBytes = FALSE, invert = FALSE)
+kimchi=grep('kimchi', sample_type, ignore.case=FALSE,perl = FALSE, value = FALSE, fixed=FALSE, useBytes = FALSE, invert = FALSE)
+unknown=grep('unknown', sample_type, ignore.case=FALSE,perl = FALSE, value = FALSE, fixed=FALSE, useBytes = FALSE, invert = FALSE)
+
+goat=grep('Goat', sample_type, ignore.case=FALSE,perl = FALSE, value = FALSE, fixed=FALSE, useBytes = FALSE, invert = FALSE)
+cow=grep('Cow', sample_type, ignore.case=FALSE,perl = FALSE, value = FALSE, fixed=FALSE, useBytes = FALSE, invert = FALSE)
+oat=grep('Oat', sample_type, ignore.case=FALSE,perl = FALSE, value = FALSE, fixed=FALSE, useBytes = FALSE, invert = FALSE)
+soy=grep('Soy', sample_type, ignore.case=FALSE,perl = FALSE, value = FALSE, fixed=FALSE, useBytes = FALSE, invert = FALSE)
+
+spain=grep('Spain', sample_type, ignore.case=FALSE,perl = FALSE, value = FALSE, fixed=FALSE, useBytes = FALSE, invert = FALSE)
+france=grep('France', sample_type, ignore.case=FALSE,perl = FALSE, value = FALSE, fixed=FALSE, useBytes = FALSE, invert = FALSE)
+blue=grep('Blue', sample_type, ignore.case=FALSE,perl = FALSE, value = FALSE, fixed=FALSE, useBytes = FALSE, invert = FALSE)
+
+activia=grep('Activia', sample_type, ignore.case=FALSE,perl = FALSE, value = FALSE, fixed=FALSE, useBytes = FALSE, invert = FALSE)
+proviva=grep('proviva', sample_type, ignore.case=FALSE,perl = FALSE, value = FALSE, fixed=FALSE, useBytes = FALSE, invert = FALSE)
+
+dry=grep('dry', sample_type, ignore.case=FALSE,perl = FALSE, value = FALSE, fixed=FALSE, useBytes = FALSE, invert = FALSE)
+active=grep('active', sample_type, ignore.case=FALSE,perl = FALSE, value = FALSE, fixed=FALSE, useBytes = FALSE, invert = FALSE)
+
+shopbought=grep('shopbought', sample_type, ignore.case=FALSE,perl = FALSE, value = FALSE, fixed=FALSE, useBytes = FALSE, invert = FALSE)
+homemade=grep('homemade', sample_type, ignore.case=FALSE,perl = FALSE, value = FALSE, fixed=FALSE, useBytes = FALSE, invert = FALSE)
+
+#Different types milk
+milk_cow=intersect(milk,cow)
+milk_goat=intersect(milk,goat)
+milk_oat=intersect(milk,oat)
+
+#different types cheese 
+blue_cheese=intersect(blue,cheese)
+spain_goat_cheese= intersect(cheese, spain)
+france_goat_cheese= intersect(cheese, france)
+
+#different types yoghurt 
+yoghurt_activia= intersect(yoghurt, activia)
+yoghurt_soy= intersect(yoghurt, soy)
+yoghurt_oat= intersect(yoghurt, oat)
+
+#different types sourdough
+sourdough_active= intersect(sourdough, active)
+sourdough_dry= intersect(sourdough, dry)
+
+#One type of Nypon proviva 
+Nypon_proviva= intersect(nypon, proviva)
+
+#different types kombucha
+kombucha_shopbought= intersect(kombucha, shopbought)
+kombucha_homemade= intersect(kombucha, homemade)
+
+#One type of kimchi 
+kimchi_shopbought= intersect(kimchi, shopbought)
+
+#extra unknown samples
+kimchi_unknown= intersect(kimchi, unknown)
+yoghurt_unknown= intersect(yoghurt, unknown)
+blue_cheese_unknown= intersect(blue_cheese, unknown)
+
+# and finally, a group with all samples, ordered by type and treatment
+#all=c(milk_cow, milk_goat, milk_oat)
+all=c(milk_cow, milk_goat, milk_oat, blue_cheese, spain_goat_cheese, france_goat_cheese, yoghurt_activia, yoghurt_soy, yoghurt_oat, nypon, sourdough_active, sourdough_dry,kombucha_shopbought, kombucha_homemade,kimchi)
+```
+
+
+And then redo the barplot, ordering the samples by type and treatment (using the `all` group we made above):
+```{r eval=F}
+# define the plotting area
+par(mfrow=c(1,1), mar=c(16,3,2,10), xpd = TRUE) #mar=c(7,3,2,10)
+
+# set what taxonomic level to plot (1 - 7)
+tax_level = 5
+
+# make the barplot
+ok = which(apply(norm_clade_counts[[tax_level]], 1, mean) > 0.01)
+barplot(
+  norm_clade_counts[[tax_level]][ok,all],
+  col = mycols(length(ok)),
+  las = 2,
+  names.arg = paste(sample_type[all], sample_name[all])
+)
+
+# add a color legend
+legend(
+  "bottomleft", bty = "n", pch = 19,
+  col = mycols(length(ok))[1:length(ok)],
+  cex = 1, inset = c(0.95,0),
+  legend = rownames(clade_counts[[tax_level]])[ok]
+)
+
+
+```
+
+### Alpha-diversity (Shannon index):
+
+To calculate alpha-diversity (within-sample diversity) we use the [vegan](https://www.google.com/url?sa=t&rct=j&q=&esrc=s&source=web&cd=5&cad=rja&uact=8&ved=2ahUKEwiCo5yV7pbnAhWsyKYKHea8AFsQFjAEegQIAhAB&url=https%3A%2F%2Fdocs.google.com%2Fviewer%3Fa%3Dv%26pid%3Dsites%26srcid%3DZGVmYXVsdGRvbWFpbnxyd29ya3Nob3BzMm58Z3g6NDgxNDc5YzQ5YzlkMWUzZg&usg=AOvVaw39FZb1H2leeU8-9Rty1B0B) package, an R package with many useful functions for ecology analysis. The `diversity` function calculates the [Shannon diversity index](https://en.wikipedia.org/wiki/Diversity_index#Shannon_index) from a community data matrix, like our `seqtab`. It will produce a vector of Shannon indexes, one index per sample (in the same order as in `seqtab`).
+
+```{r eval=F}
+# Calculate Shannon diversity for every sample and put in a vector named shannon
+
+#all=c(milk_cow, milk_goat, milk_oat, blue_cheese, spain_goat_cheese, france_goat_cheese, yoghurt_activia, yoghurt_soy, yoghurt_oat, nypon, sourdough_active, sourdough_dry,kombucha_shopbought, kombucha_homemade,kimchi)
+par(mfrow=c(1,1), mar=c(16,3,2,10), xpd = TRUE)
+shannon = diversity(seqtab, MARGIN = 2)
+
+# We can make a bargraph of the Shannon diversities.
+# - We order the samples using the "all" group
+barplot(
+  shannon[all], las = 2,
+  names.arg = paste(sample_type[all],sample_name[all])
+)
+
+# or summarise them in boxplots, one per sample group/treatment
+boxplot(
+  shannon[milk],
+  shannon[cheese],
+  shannon[yoghurt],
+  shannon[nypon],
+  shannon[sourdough],
+  shannon[kombucha],
+  shannon[kimchi],
+  names = c(
+    "milk",
+    "cheese",
+    "yoghurt",
+    "nypon",
+    "sourdough",
+    "kombucha", 
+    "kimchi"
+  ),
+  las = 2
+)
+#milk_cow, milk_goat, milk_oat, blue_cheese, spain_goat_cheese, france_goat_cheese, yoghurt_activia, yoghurt_soy, yoghurt_oat, nypon, sourdough_active, sourdough_dry,kombucha_shopbought, kombucha_homemade,kimchi)
+```
+
+
+```{r eval=F}
+#change for which you want to analyse
+wilcox.test(shannon[kimchi_unknown], shannon[nypon])
+wilcox.test(shannon[milk_cow], shannon[milk_goat])
+wilcox.test(shannon[milk_cow], shannon[milk_oat])
+ #shannon[milk_cow], shannon[milk_goat],shannon[milk_oat],
+  #shannon[blue_cheese], shannon[spain_goat_cheese],shannon[france_goat_cheese],
+  #shannon[yoghurt_activia], shannon[yoghurt_soy],shannon[yoghurt_oat],
+```
+
+
+### Beta-diversity (Bray-Curtis):
+
+Now let's investigate beta-diversity (between-sample community differences) of our dataset. We use the `vegdist` function of `vegan` and use [Bray-Curtis](https://en.wikipedia.org/wiki/Bray%E2%80%93Curtis_dissimilarity) as the distance metric. This will give us a distance matrix, a matrix of pairwise community distances.
+
+```{r eval=F}
+bray_dist = as.matrix(vegdist(t(norm_seqtab), method = "bray"))
+# Let's have a look at the matrix
+bray_dist
+```
+
+We can visualise the distance matrix as a heatmap, using the `pheatmap` function of the package with the same name:
+
+```{r eval=F}
+pheatmap(
+  bray_dist[c(25,42),c(25,42)],
+  #milk: c(1,6,7,16,26,30,33,35,40,43,46,47,48),c(1,6,7,16,26,30,33,35,40,43,46,47,48)
+  #cheese: c(2,9,21,22,24,29,32,34,36,37,39),c(2,9,21,22,24,29,32,34,36,37,39)
+  #yoghurt: c(5,10,15,19,23,27,41,44,45,51,52),c(5,10,15,19,23,27,41,44,45,51,52)
+  #nypon: c(8,11,12,14,20),c(8,11,12,14,20)
+  #sourdough: c(3,4,18,28,38,49,53),c(3,4,18,28,38,49,53)
+  #kombucha:25,42,
+  #kimchi: c(17,31,50,54),c(17,31,50,54)
+  cluster_rows = FALSE, cluster_cols = FALSE,
+  labels_row = paste(sample_type[kombucha],sample_name[kombucha]),
+  labels_col = paste(sample_type[kombucha],sample_name[kombucha])
+)
+
+```
+
+And we can also cluster the samples using hierarchical clustering based on the pairwise distances from `bray_dist`. The clustering diagram will be shown to the left and in the top, and the rows and columns of the heatmap will be reordered accordingly.
+
+```{r eval=F}
+png(paste(format("heatmap_cheese"), "png", sep="."), width=10, height=8, units="in" , res=300)  #heatmap1.png")
+setwd("/Users/intisarsalim/Desktop")
+pheatmap(
+  bray_dist,
+  clustering_distance_rows = as.dist(bray_dist),
+  clustering_distance_cols = as.dist(bray_dist),
+  labels_row = paste(sample_type,sample_name),
+  labels_col = paste( sample_type,sample_name)
+)
+dev.off()
+```
+
+
+### ANOSIM analysis
+
+To check if the clustering of samples observed above is statistically significant we can run an Analysis of similarities ([ANOSIM](https://sites.google.com/site/mb3gustame/hypothesis-tests/anosim)) test. The ANOSIM statistic compares the mean of dissimilarities (in our case Bray-Curtis distances) between groups to the mean of dissimilarities within groups. An r-value close to 1 suggests dissimilarity between groups are larger than within groups while a value close to 0 suggests an even distribution of dissimilarities within and between groups.
+
+First we test if communities are significantly more similar within than between sample types:
+
+```{r eval=F}
+these = c(all)
+anosim(bray_dist[these,these], sample_type[these], permutations = 9999)
+```
+
+
+### Differential abundance analysis
+
+The ANOSIM tests may show that the sample groups are different at the _overall_ community level. To test which (if any) _specifc taxa_ differ significantly between groups, we can run a differential abundance analysis. Several tools developed for RNAseq data such as EdgeR, DESeq2 and SAMseq can be used also for taxonomic marker gene amplicon sequencing data. Here we will use [edgeR](https://www.bioconductor.org/packages/devel/bioc/vignettes/edgeR/inst/doc/edgeRUsersGuide.pdf). The analysis can be run on any taxonomic level, from the domain to the ASV level. Here we will run it on the class level.
+
+Let's check what orders differ in abundance between the uncultured environmental sample types (soil and water)
+
+```{r eval=F}
+# Define two groups
+group1 = spain_goat_cheese
+#group2 = blue_cheese
+group2 = france_goat_cheese
+
+# then run the statistical analysis
+x = clade_counts[[5]][,c(group1, group2)]
+group = factor(c(rep(1, length(group1)), rep(2, length(group2))))
+y = DGEList(counts=x, group=group)
+y = calcNormFactors(y)
+design = model.matrix(~group)
+y = estimateDisp(y, design)
+fit = glmQLFit(y, design)
+
+qlf = glmQLFTest(fit, coef=2)
+```
+
+Now the differential analysis is done, the results are stored in the `qlf` object. We can extract the taxa with the most significant difference in abundance between the two sample groups using the `topTags` function. `p.value = 0.05` means we only extract those with a False Discovery Rate (FDR) adjusted p-value of < 0.05 (i.e. out of the extracted taxa, <5% are believed to be false positives).
+
+```{r eval=F}
+# To print on screen
+topTags(qlf, n=1000, p.value=0.05)
+```
+
+"logFC" = log$\sf{_{2}}$ fold change in normalised counts between the two sample groups
+
+"logCPM" = Average log$\sf{_{2}}$ counts per million reads, the average taken over all samples
+
+
+We can visualise the abundance distribution of the significant taxa with a heatmap:
+
+```{r eval=F}
+# we extract the names of the significant taxa
+sign_clades = rownames(topTags(qlf, n=1000, p.value=0.05))
+
+# we use the match function to get the corresponding rows in the clade_counts matrix
+ix = match(sign_clades, rownames(clade_counts[[4]]))
+
+# and plot those rows in the normalised clade_counts matrix in a heatmap
+# we set cluster_rows=TRUE to cluster taxa according to their abundance patterns
+pheatmap(
+  norm_clade_counts[[4]][ix, c(group1,group2)],
+  cluster_cols=FALSE, cluster_rows=TRUE,
+  labels_row = rownames(clade_counts[[4]])[ix],
+  cex = 0.8,
+  labels_col = paste(
+    sample_name[c(group1,group2)],
+    sample_type[c(group1,group2)]
+  ),
+  clustering_distance_rows = "correlation"
+)
+```
